@@ -1,0 +1,15 @@
+matplotlib
+torch>=2.1.2
+torchvision
+torcheval
+tqdm
+matplotlib
+joblib
+astropy>6.0.0
+xformers
+tensorboard
+scikit-learn
+
+dino-finetune @ git+https://github.com/sara-nl/dinov2-finetune.git
+cortexchange @ git+https://github.com/sara-nl/cortExchange.git
+
