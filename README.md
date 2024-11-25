@@ -1,9 +1,7 @@
 # Step by step for running a model
-## Install requirements
+## Install repository
 ```shell
-python -m venv venv
-source activate venv/bin/activate
-pip install -r requirements.txt
+pip install git+https://github.com/LOFAR-VLBI/astroNNomy.git
 ```
 
 ## Get training data
