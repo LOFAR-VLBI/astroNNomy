@@ -55,9 +55,13 @@ fi
 DATA_INPUT_PATH="/scratch-shared/CORTEX/"
 # find $DATA_INPUT_PATH -name '*npz' | xargs -n 1 -P 18 -i rsync -R {} '/dev/shm/'
 
-DATA_TRAINDATA_PATH="/scratch-shared/CORTEX/public.spider.surfsara.nl/lofarvwf/jdejong/CORTEX/calibrator_selection_robertjan/cnn_data/"
+DATA_PATH="/scratch-shared/CORTEX/public.spider.surfsara.nl/lofarvwf/jdejong/CORTEX/calibrator_selection_robertjan/cnn_data/"
 
+find $DATA_PATH -type f -name "*.npz" | xargs -n 1 -P 8 -i rsync -R {} /dev/shm
+find $DATA_PATH -type d -name "_cache" | xargs -n 1 -P 8 -I {} rsync -aR {}/ /dev/shm
+
+DATA_TRAINDATA_PATH="/dev/shm$DATA_PATH"
 
 # Execute your Python script with the given parameters
-echo  $DATA_TRAINDATA_PATH --model $model --lr $lr --normalize $normalize --dropout_p $dropout_p --batch_size $batch_size --log_path grid_search_2 --label_smoothing $label_smoothing --rank $rank --resize $resize --alpha $alpha  $LORA_ARG $STOCHASTIC_SMOOTHING -d --epochs $EPOCHS --lift $lift $FLIP_AUGMENTATIONS 
-python train_nn.py $DATA_TRAINDATA_PATH --model $model --lr $lr --normalize $normalize --dropout_p $dropout_p --batch_size $batch_size --log_path grid_search_2 --label_smoothing $label_smoothing --rank $rank --resize $resize --alpha $alpha  $LORA_ARG $STOCHASTIC_SMOOTHING -d --epochs $EPOCHS --lift $lift $FLIP_AUGMENTATIONS 
+echo  $DATA_TRAINDATA_PATH --model $model --lr $lr --normalize $normalize --dropout_p $dropout_p --batch_size $batch_size --log_path grid_search_2 --label_smoothing $label_smoothing --rank $rank --resize $resize --alpha $alpha  $LORA_ARG $STOCHASTIC_SMOOTHING -d --epochs $EPOCHS --lift $lift --pos_embed $pos_embed
+python train_nn.py $DATA_TRAINDATA_PATH --model $model --lr $lr --normalize $normalize --dropout_p $dropout_p --batch_size $batch_size --log_path grid_search_2 --label_smoothing $label_smoothing --rank $rank --resize $resize --alpha $alpha  $LORA_ARG $STOCHASTIC_SMOOTHING -d --epochs $EPOCHS --lift $lift --pos_embed $pos_embed

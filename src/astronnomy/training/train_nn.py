@@ -17,7 +17,8 @@ from torchvision.transforms import v2
 from torchvision.transforms.functional import InterpolationMode
 from tqdm import tqdm
 
-from dino_model import DINOV2FeatureExtractor
+from .dino_model import DINOV2FeatureExtractor
+
 from ..pre_processing_for_ml import FitsDataset
 
 PROFILE = False
@@ -151,7 +152,7 @@ class ImagenetTransferLearning(nn.Module):
         use_lora: bool = False,
         alpha: float = 16.0,
         rank: int = 16,
-        pos_embed: bool = False,
+        pos_embed: str = "pre-trained",
     ):
         super().__init__()
 
