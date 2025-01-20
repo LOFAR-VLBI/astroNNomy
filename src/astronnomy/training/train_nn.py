@@ -744,7 +744,7 @@ def save_checkpoint(logging_dir, model, optimizer, global_step, **kwargs):
 
 def load_checkpoint(ckpt_path, device="cuda"):
     if os.path.isfile(ckpt_path):
-        ckpt_dict = torch.load(ckpt_path, weights_only=False)
+        ckpt_dict = torch.load(ckpt_path, weights_only=False, map_location=device)
     else:
         files = os.listdir(ckpt_path)
         possible_checkpoints = list(filter(lambda x: x.endswith(".pth"), files))
@@ -753,7 +753,7 @@ def load_checkpoint(ckpt_path, device="cuda"):
                 f"Too many checkpoint files in the given checkpoint directory. Please specify the model you want to load directly."
             )
         ckpt_path = f"{ckpt_path}/{possible_checkpoints[0]}"
-        ckpt_dict = torch.load(ckpt_path, weights_only=False)
+        ckpt_dict = torch.load(ckpt_path, weights_only=False, map_location=device)
 
     # strip 'model_' from the name
     model_name = ckpt_dict["args"]["model_name"]
