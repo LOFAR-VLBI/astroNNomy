@@ -8,16 +8,17 @@ password = os.getenv("WD_PASSWORD")
 
 init_downloader(
     url="https://researchdrive.surfsara.nl/public.php/webdav/",
-    cache="/home/larsve/.cache/cortexchange",
+    cache=f"{os.path.join(os.path.expanduser('~'), '.cache/cortexchange')}",
     login=login,
     password=password,
-    # cache=".cache/cortexchange",
 )
 
 from cortexchange.architecture import get_architecture, Architecture
 
 TransferLearning: type(Architecture) = get_architecture("surf/TransferLearning")
-model = TransferLearning(device="cpu", model_name="surf/dinov2_09814")
+model = TransferLearning(
+    device="cpu", model_name="surf/dino_big_lora_default_pos_november_09876"
+)
 
 print(model.args)
 
