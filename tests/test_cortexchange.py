@@ -1,17 +1,27 @@
 from cortexchange.wdclient import init_downloader
+import os
+
+# Make sure to store these variables.
+login = os.getenv("WD_LOGIN")
+password = os.getenv("WD_PASSWORD")
+
 
 init_downloader(
     url="https://researchdrive.surfsara.nl/public.php/webdav/",
-    login="JeofximLVcr8Ttm",
-    password="?CortexAdminTest1?",
     cache="/home/larsve/.cache/cortexchange",
+    login=login,
+    password=password,
     # cache=".cache/cortexchange",
 )
 
 from cortexchange.architecture import get_architecture, Architecture
 
 TransferLearning: type(Architecture) = get_architecture("surf/TransferLearning")
-model = TransferLearning(device="cpu", model_name="surf/dinov2_october_09902_lora")
+model = TransferLearning(device="cpu", model_name="surf/dinov2_09814")
+
+print(model.args)
+
+exit()
 
 # torch_tensor = model.prepare_data(
 #     "ILTJ160454.72+555949.7_selfcal/selfcal_007-MFS-image.fits"
