@@ -10,7 +10,6 @@ import torch
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 
-
 @torch.no_grad()
 def get_confusion_matrix(predictor, dataloader, mean, std, thresholds):
     conf_matrix_dict = {thres: np.zeros((2, 2)) for thres in thresholds}
@@ -33,18 +32,18 @@ def plot_conf_matrices(savedir, conf_matrix_dict):
 
         disp = ConfusionMatrixDisplay(
             conf_matrix / np.sum(conf_matrix, axis=1, keepdims=True),  # Normalization
-            display_labels=["stop", "continue"]
+            display_labels=["stop", "continue"],
         )
 
         fig, ax = plt.subplots()
-        disp.plot(cmap='Blues', ax=ax)
+        disp.plot(cmap="Blues", ax=ax)
         im = ax.images[0]
         im.set_clim(0, 1)
 
         ax.set_xlabel("Predicted Label", fontsize=16)
         ax.set_ylabel("True Label", fontsize=16)
 
-        ax.tick_params(axis='both', which='major', labelsize=16)
+        ax.tick_params(axis="both", which="major", labelsize=16)
 
         for text in disp.text_.ravel():
             text.set_fontsize(16)
@@ -57,7 +56,6 @@ def plot_conf_matrices(savedir, conf_matrix_dict):
 
         plt.savefig(f"{savedir}/confusion_thres_{thres:.3f}.png", dpi=150)
         plt.close(fig)
-
 
 
 if __name__ == "__main__":
@@ -74,4 +72,6 @@ if __name__ == "__main__":
 
     print(conf_matrix_dict)
 
-    plot_conf_matrices('/home/jurjen/Documents/ELAIS/paperplots', conf_matrix_dict, thresholds)
+    plot_conf_matrices(
+        "/home/jurjen/Documents/ELAIS/paperplots", conf_matrix_dict, thresholds
+    )

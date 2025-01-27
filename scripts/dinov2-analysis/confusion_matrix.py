@@ -170,7 +170,7 @@ def get_dataloader(data_root, mode="val", batch_size=32):
 
 if __name__ == "__main__":
     # Latest model
-    model_name = "surf/dinov2_09739_rotations"
+    model_name = "surf/dino_big_lora_default_pos_november_09876"
     TESTING = True
     architecture_name = "surf/TransferLearning"
     # Set Device here
@@ -186,6 +186,8 @@ if __name__ == "__main__":
     if Path(dict_fname).exists() and TESTING:
         conf_matrix_dict = np.load(dict_fname, allow_pickle=True)[()]
     else:
+
+        os.makedirs(savedir, exist_ok=True)
 
         dataloader = get_dataloader(data_root, mode="val")
 
