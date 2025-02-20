@@ -194,7 +194,7 @@ class FitsDataset(Dataset):
         means = []
         sums_of_squares = []
         f = (lambda x: torch.log(x + 1e-10)) if normalize == 2 else lambda x: x
-        for i, (imgs, _) in enumerate(loader):
+        for i, (imgs, *_) in enumerate(loader):
             imgs = f(imgs)
             means.append(torch.mean(imgs, dim=(1, 2)))
             sums_of_squares.append((imgs**2).sum(dim=(1, 2)))
