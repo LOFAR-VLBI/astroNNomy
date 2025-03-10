@@ -91,8 +91,10 @@ def transform_data(root_dir, classes=("continue", "stop"), modes=("", "_val")):
 
     def process_fits(fits_path):
         with fits.open(fits_path) as hdul:
-            image_data = hdul[0].data
-        if image_data.shape[2] == 2048:
+            image_data = hdul[0].data.squeeze()
+        if image_data.shape[-1] == 2048 and image_data.shape[-2] == 2048:
+            # Set NaNs to 0
+            image_data = np.nan_to_num(image_data, nan=0)
             transformed = normalize_fits(image_data)
 
             np.savez_compressed(
