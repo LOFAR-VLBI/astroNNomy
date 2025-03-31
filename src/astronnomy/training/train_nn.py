@@ -356,11 +356,8 @@ def merge_metrics(suffix, **kwargs):
 def prepare_data(
     data: torch.Tensor,
     labels: torch.Tensor,
-    resize: int,
-    normalize: int,
     device: torch.device,
-    mean: torch.Tensor,
-    std: torch.Tensor,
+    transform=v2.Compose([v2.Identity()]),
 ):
 
     data, labels = (
@@ -368,10 +365,12 @@ def prepare_data(
         labels.to(device, non_blocking=True, dtype=data.dtype),
     )
 
-    if resize:
-        data = interpolate(data, size=resize, mode="bilinear", align_corners=False)
+    data = transform(data)
 
-    data = normalize_inputs(data, mean, std, normalize)
+    # if resize:
+    #     data = interpolate(data, size=resize, mode="bilinear", align_corners=False)
+
+    # data = normalize_inputs(data, mean, std, normalize)
 
     return data, labels
 
@@ -381,6 +380,9 @@ def main(
     model_name: str,
     lr: float,
     resize: int,
+    resize_min: int,
+    resize_max: int,
+    rotations: str,
     normalize: int,
     dropout_p: float,
     batch_size: int,
@@ -463,17 +465,22 @@ def main(
             step_f,
             prepare_data_f=partial(
                 prepare_data,
-                resize=resize,
-                normalize=normalize,
                 device=device,
-                mean=mean,
-                std=std,
+                transform=get_transforms(
+                    rotations="none" if val else rotations,
+                    crop=True if rotations == "continuous" else False,
+                    resize=resize_max if val else resize,
+                    resize_min=0 if val else resize_min,
+                    resize_max=0 if val else resize_max,
+                    mean=mean,
+                    std=std,
+                ),
             ),
             metrics_logger=partial(
                 log_metrics, write_metrics_f=partial(write_metrics, writer=writer)
             ),
         )
-        for step_f in (train_step, val_step)
+        for val, step_f in enumerate([train_step, val_step])
     )
 
     train_step_f = partial(
@@ -638,7 +645,7 @@ def train_step(
         global_step += 1
         data, labels = prepare_data_f(data, labels)
         smoothed_label = smoothing_fn(labels)
-        data = augmentation(data)
+        # data = augmentation(data)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -713,15 +720,91 @@ class Rotate90Transform:
         return v2.functional.rotate(x, int(angle), InterpolationMode.BILINEAR)
 
 
-@lru_cache(maxsize=1)
-def get_transforms():
+class RotateAndCrop:
+    def __init__(self, rotate=True):
+        self.rotate = rotate
+        self.max_crop_factor = np.sqrt(2)
 
-    return v2.Compose(
-        [
-            (Rotate90Transform()),
-            v2.RandomHorizontalFlip(p=0.5),
-        ]
-    )
+    def __call__(self, x):
+        angle = 0
+        if self.rotate:
+            angle = np.random.uniform(-180, 180)
+            x = v2.functional.rotate(x, angle, InterpolationMode.BILINEAR)
+
+        angle_rad = np.deg2rad(angle)
+        *_, h, w = x.shape
+        # Compute the factor with which the image needs to be cropped to perfectly fit the largest possible square
+        min_crop_factor = abs(np.cos(angle_rad)) + abs(np.sin(angle_rad))
+        crop_size = int(
+            min(h, w) / np.random.uniform(min_crop_factor, self.max_crop_factor)
+        )
+
+        return v2.functional.center_crop(x, crop_size)
+
+
+class ResizeAndNoise:
+    def __init__(self, resize=0):
+        self.resize = resize
+
+    def __call__(self, x):
+        *_, h, w = x.shape
+        resize_factor = self.resize / max(h, w)
+        sigma = 0.5 * resize_factor
+        x = x + torch.randn_like(x) * sigma
+        x = interpolate(
+            x,
+            size=(int(h * resize_factor), int(w * resize_factor)),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x
+
+
+class RandomResizeAndNoise:
+    def __init__(self, resize_min=0, resize_max=0):
+        self.sizes = list(range(resize_min, resize_max + 1, 56))
+
+    def __call__(self, x):
+        *_, h, w = x.shape
+        size = np.random.choice(self.sizes)
+        resize_factor = size / h
+        sigma = 0.5 * resize_factor
+        x = x + torch.randn_like(x) * sigma
+        x = interpolate(
+            x,
+            size=(size, size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x
+
+
+@lru_cache(maxsize=1)
+def get_transforms(
+    rotations: str = "none",
+    crop: bool = False,
+    resize: int = 0,
+    resize_min: int = 0,
+    resize_max: int = 0,
+    mean: float = 0,
+    std: float = 1,
+):
+
+    transforms = [v2.Normalize(mean=mean, std=std)]
+
+    if rotations == "orthogonal" and eval:
+        transforms.append(Rotate90Transform())
+    elif rotations == "continuous" or crop:
+        transforms.append(RotateAndCrop(rotate=rotations == "continuous"))
+
+    if resize:
+        transforms.append(ResizeAndNoise(resize))
+    elif resize_min and resize_max:
+        transforms.append(RandomResizeAndNoise(resize_min, resize_max))
+
+    if rotations != "none":
+        transforms.append(v2.RandomHorizontalFlip(p=0.5))
+    return v2.Compose(transforms)
 
 
 def save_checkpoint(logging_dir, model, optimizer, global_step, **kwargs):
@@ -808,7 +891,7 @@ def get_argparser():
         "--model_name",
         type=str,
         help="The model to use.",
-        default="resnet50",
+        default="dinov2_vitb14_reg",
         choices=[
             "resnet50",
             "resnet152",
@@ -831,7 +914,7 @@ def get_argparser():
         type=int,
         help="Whether to do normalization",
         default=1,
-        choices=[0, 1, 2],
+        choices=[0, 1],
     )
     parser.add_argument(
         "--dropout_p", type=float, help="Dropout probability", default=0.25
@@ -840,8 +923,31 @@ def get_argparser():
         "--resize",
         type=int,
         default=0,
-        help="size to resize to. Will be set to 512 for ViT.",
+        help="Resize the images to this size. 0 means no resizing. Cannot be used in conjunction with resize_min and resize_max.",
     )
+
+    parser.add_argument(
+        "--resize_min",
+        type=int,
+        default=0,
+        help="Minimum size to resize to during random resizing for each training batch. Cannot be used in conjuction with resize.",
+    )
+
+    parser.add_argument(
+        "--resize_max",
+        type=int,
+        default=0,
+        help="Maximum size to resize to for each training batch. Cannot be used in conjunction with resize.",
+    )
+
+    parser.add_argument(
+        "--rotations",
+        type=str,
+        default="none",
+        choices=["orthogonal", "continuous", "none"],
+        help='Rotations to apply to the images. "orthogonal" means multiples of 90 degree rotations, "continuous" means any rotation (resulting in additional cropping), "none" means no rotations.',
+    )
+
     parser.add_argument(
         "--epochs",
         type=int,
@@ -925,21 +1031,45 @@ def sanity_check_args(parsed_args):
     if parsed_args.model_name == "vit_l_16" and parsed_args.resize != 512:
         print("Setting resize to 512 since vit_16_l is being used")
         parsed_args.resize = 512
-    if "dinov2" in parsed_args.model_name and parsed_args.resize == 0:
+    if (
+        "dinov2" in parsed_args.model_name
+        and parsed_args.resize == 0
+        and parsed_args.resize_min == 0
+        and parsed_args.resize_max == 0
+    ):
         resize = 560
         print(f"\n#######\nSetting resize to {resize} \n######\n")
         parsed_args.resize = resize
+
+    assert not (
+        parsed_args.resize != 0
+        and (parsed_args.resize_min != 0 or parsed_args.resize_max != 0)
+    ), "resize cannot be set together with resize_min or resize_max."
+
+    assert not (
+        (parsed_args.resize_min != 0 and parsed_args.resize_max == 0)
+        or (parsed_args.resize_min == 0 and parsed_args.resize_max != 0)
+    ), "Both resize_min and resize_max must be set together."
 
     if parsed_args.use_lora and not "dinov2" in parsed_args.model_name:
         warnings.warn(
             "Warning: LoRA is only supported for Dino V2 models. Ignoring setting....\n",
             UserWarning,
         )
+        parsed_args.use_lora = False
 
     if parsed_args.alpha is None:
         parsed_args.alpha = parsed_args.rank
 
-    assert parsed_args.resize % 14 == 0 or parsed_args.model_name != "dino_v2"
+    assert (
+        parsed_args.resize % 56 == 0 or parsed_args.model_name != "dino_v2"
+    ), "resizing must be a multiple of 56 for Dino V2 models (8 for efficiency, 14 for patch size)"
+    assert (
+        parsed_args.resize_min % 56 == 0 or parsed_args.model_name != "dino_v2"
+    ), "resizing must be a multiple of 14 for Dino V2 models (8 for efficiency, 14 for patch size)"
+    assert (
+        parsed_args.resize_max % 56 == 0 or parsed_args.model_name != "dino_v2"
+    ), "resizing must be a multiple of 14 for Dino V2 models (8 for efficiency, 14 for patch size)"
 
     return parsed_args
 
