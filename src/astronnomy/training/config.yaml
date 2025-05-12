@@ -1,0 +1,41 @@
+model: 
+  model_name: dinov2_vitb14_reg
+  dropout_p: 0.1
+  lift: stack
+  use_lora: true
+  lora_rank: 32
+  lora_alpha: 64
+  tune_register_token: false
+  tune_cls_token: false
+  pos_embed: pre-trained
+  use_compile: false
+
+training:
+  epochs: 60
+  label_smoothing: 0.1
+  stochastic_smoothing: false
+
+dataloader:
+  dataset_root: /scratch-shared/CORTEX/public.spider.surfsara.nl/lofarvwf/jdejong/CORTEX/calibrator_selection_robertjan/cnn_data/
+  batch_size: 32
+
+optimizer:
+  lr: 0.0001
+
+data_transforms:
+  resize_min: 224
+  resize_max: 896
+  resize_val : 560
+  transform_group: O2
+  normalize: true
+
+logging:
+  wandb:
+    mode: online
+    project: astroNNomy_augment_tokens_2
+    save_code: true
+  log_dir: grid_search_augment_tokens
+  log_frequency: 10
+
+reproducibility:
+  seed: 42

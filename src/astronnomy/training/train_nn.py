@@ -1,464 +1,65 @@
 import argparse
-import os
-import random
+from argparse import Namespace
+import yaml
 import warnings
-from functools import partial, lru_cache
+from functools import partial
 from pathlib import Path
-
-import numpy as np
 import torch
-import torcheval.metrics.functional as tef
 from torch import nn, binary_cross_entropy_with_logits
-from torch.nn.functional import interpolate
-from torch.utils.data import Sampler
-from torch.utils.tensorboard import SummaryWriter
-from torchvision import models
-from torchvision.transforms import v2
-from torchvision.transforms.functional import InterpolationMode
+
 from tqdm import tqdm
 
-from .dino_model import DINOV2FeatureExtractor
-
-from ..pre_processing_for_ml import FitsDataset
-
-PROFILE = False
-SEED = None
-
-
-def init_vit(model_name):
-    assert model_name == "vit_l_16"
-
-    backbone = models.vit_l_16(weights="ViT_L_16_Weights.IMAGENET1K_SWAG_E2E_V1")
-    for param in backbone.parameters():
-        param.requires_grad_(False)
-
-    # backbone.class_token[:] = 0
-    backbone.class_token.requires_grad_(True)
-
-    hidden_dim = backbone.heads[0].in_features
-
-    del backbone.heads
-    return backbone, hidden_dim
-
-
-def init_dino(model_name, get_classifier_f, use_lora, rank=16, alpha=16):
-
-    backbone = torch.hub.load("facebookresearch/dinov2", model_name)
-    hidden_dim = backbone.cls_token.shape[-1]
-    classifier = get_classifier_f(n_features=hidden_dim)
-
-    dino_lora = DINOV2FeatureExtractor(
-        encoder=backbone,
-        decoder=classifier,
-        r=rank,
-        use_lora=use_lora,
-        alpha=alpha,
-    )
-
-    return dino_lora, hidden_dim
-
-
-def init_cnn(name: str, lift="stack"):
-    # use partial to prevent loading all models at once
-    model_map = {
-        "resnet50": partial(models.resnet50, weights="DEFAULT"),
-        "resnet152": partial(models.resnet152, weights="DEFAULT"),
-        "resnext50_32x4d": partial(models.resnext50_32x4d, weights="DEFAULT"),
-        "resnext101_64x4d": partial(models.resnext101_64x4d, weights="DEFAULT"),
-        "efficientnet_v2_l": partial(models.efficientnet_v2_l, weights="DEFAULT"),
-    }
-
-    backbone = model_map[name]()
-
-    feature_extractor = nn.Sequential(*list(backbone.children())[:-1])
-    for param in feature_extractor.parameters():
-        param.requires_grad_(False)
-
-    if lift == "reinit_first":
-        if name in ("resnet50", "resnet152", "resnext50_32x4d", "resnext101_64x4d"):
-            conv = feature_extractor[0]
-            new_conv = init_first_conv(conv)
-            feature_extractor[0] = new_conv
-            del conv
-        elif name == "efficientnet_v2_l":
-            conv = feature_extractor[0][0][0]
-            new_conv = init_first_conv(conv)
-            feature_extractor[0][0][0] = new_conv
-            del conv
-
-    num_out_features = (
-        backbone.fc
-        if name in ("resnet50", "resnet152", "resnext50_32x4d", "resnext101_64x4d")
-        else backbone.classifier[-1]  # efficientnet
-    ).in_features
-    return feature_extractor, num_out_features
-
-
-def init_first_conv(conv):
-    kernel_size = conv.kernel_size
-    stride = conv.stride
-    padding = conv.padding
-    bias = conv.bias
-    out_channels = conv.out_channels
-    return nn.Conv2d(
-        in_channels=1,
-        out_channels=out_channels,
-        kernel_size=kernel_size,
-        stride=stride,
-        padding=padding,
-        bias=bias,
-    )
-
-
-def get_classifier(dropout_p: float, n_features: int, num_target_classes: int):
-    assert 0 <= dropout_p <= 1
-    print(n_features)
-
-    classifier = nn.Sequential(
-        nn.Flatten(),
-        nn.Dropout1d(p=dropout_p),
-        nn.Linear(n_features, n_features),
-        nn.ReLU(),
-        nn.Linear(n_features, num_target_classes),
-    )
-
-    return classifier
-
-
-@torch.no_grad()
-def normalize_inputs(inputs, means, stds, normalize=1):
-    if normalize == 2:
-        inputs = torch.log(inputs + 1e-10)
-    return (inputs - means[None, :, None, None].to(inputs.device)) / stds[
-        None, :, None, None
-    ].to(inputs.device)
-
-
-@torch.no_grad()
-def augmentation(inputs):
-    inputs = get_transforms()(inputs)
-    inputs = inputs + 0.01 * torch.randn_like(inputs)
-
-    return inputs
-
-
-class ImagenetTransferLearning(nn.Module):
-    def __init__(
-        self,
-        model_name: str = "resnet50",
-        dropout_p: float = 0.25,
-        use_compile: bool = True,
-        lift: str = "stack",
-        use_lora: bool = False,
-        alpha: float = 16.0,
-        rank: int = 16,
-        pos_embed: str = "pre-trained",
-    ):
-        super().__init__()
-
-        get_classifier_f = partial(
-            get_classifier, dropout_p=dropout_p, num_target_classes=1
-        )
-
-        # For saving in the state dict
-        self.kwargs = {
-            "model_name": model_name,
-            "dropout_p": dropout_p,
-            "use_compile": use_compile,
-            "lift": lift,
-            "use_lora": use_lora,
-            "rank": rank,
-            "alpha": alpha,
-            "pos_embed": pos_embed,
-        }
-
-        if lift == "stack":
-            self.lift = partial(torch.repeat_interleave, repeats=3, dim=1)
-        elif lift == "conv":
-            self.lift = nn.Conv2d(1, 3, 1)
-        elif lift == "reinit_first":
-            self.lift = nn.Identity()
-
-        if model_name == "vit_l_16":
-            self.vit, num_features = init_vit(model_name)
-            self.vit.eval()
-
-            classifier = get_classifier_f(n_features=num_features)
-            self.vit.heads = classifier
-
-            self.forward = self.vit_forward
-
-        elif "dinov2" in model_name:
-            self.dino, num_features = init_dino(
-                model_name, get_classifier_f, use_lora=use_lora, alpha=alpha, rank=rank
-            )
-            # self.classifier = get_classifier_f(n_features=num_features)
-            if "zeros" in self.kwargs["pos_embed"]:
-                self.dino.encoder.pos_embed[:, 1:, :] = torch.zeros_like(
-                    self.dino.encoder.pos_embed[:, 1:, :]
-                )
-            self.dino.encoder.pos_embed.requires_grad = (
-                True if "fine-tune" in self.kwargs["pos_embed"] else False
-            )
-            self.forward = self.dino_forward
-
-        else:
-            self.feature_extractor, num_features = init_cnn(name=model_name, lift=lift)
-            self.feature_extractor.eval()
-
-            self.classifier = get_classifier_f(n_features=num_features)
-
-            self.forward = self.cnn_forward
-
-        if use_compile:
-            self.forward = torch.compile(model=self.forward, mode="reduce-overhead")
-
-    # @partial(torch.compile, mode='reduce-overhead')
-    def cnn_forward(self, x):
-        x = self.lift(x)
-        representations = self.feature_extractor(x)
-        x = self.classifier(representations)
-        return x
-
-    # @partial(torch.compile, mode='reduce-overhead')
-    def vit_forward(self, x):
-        x = self.lift(x)
-        x = self.vit.forward(x)
-
-        return x
-
-    def dino_forward(self, x):
-        x = self.lift(x)
-        return self.dino(x)
-
-    def step(self, inputs, targets, ratio=1):
-        logits = self(inputs).flatten()
-
-        loss = binary_cross_entropy_with_logits(
-            logits, targets, pos_weight=torch.as_tensor(ratio)
-        )
-
-        if PROFILE:
-            global profiler
-            profiler.step()
-
-        return logits, loss
-
-    def eval(self):
-        if self.kwargs["model_name"] == "vit_l_16":
-            self.vit.heads.eval()
-        elif "dinov2" in self.kwargs["model_name"]:
-            if self.kwargs["use_lora"]:
-                self.dino.eval()
-            else:
-                self.dino.decoder.eval()
-        else:
-            self.classifier.eval()
-
-    def train(self):
-        if self.kwargs["model_name"] == "vit_l_16":
-            self.vit.heads.train()
-        elif "dinov2" in self.kwargs["model_name"]:
-            if self.kwargs["use_lora"]:
-                self.dino.train()
-            else:
-                self.dino.decoder.train()
-            # Finetune learnable pos_embedding
-
-        else:
-            self.classifier.train()
-
-
-def get_dataloaders(dataset_root, batch_size):
-    num_workers = min(18, len(os.sched_getaffinity(0)))
-
-    prefetch_factor, persistent_workers = (
-        (2, True) if num_workers > 0 else (None, False)
-    )
-    generators = {}
-    for mode in ("val", "train"):
-        generators[mode] = torch.Generator()
-        if SEED is not None:
-            generators[mode].manual_seed(SEED)
-
-    loaders = tuple(
-        MultiEpochsDataLoader(
-            dataset=FitsDataset(dataset_root, mode=mode),
-            batch_size=batch_size,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers,
-            worker_init_fn=seed_worker,
-            generator=generators[mode],
-            pin_memory=True,
-            shuffle=True if mode == "train" else False,
-            drop_last=True if mode == "train" else False,
-        )
-        for mode in ("train", "val")
-    )
-
-    return loaders
-
-
-def get_logging_dir(logging_root: str, /, **kwargs):
-    # As version string, prefer $SLURM_ARRAY_JOB_ID, then $SLURM_JOB_ID, then 0.
-    version = int(os.getenv("SLURM_ARRAY_JOB_ID", os.getenv("SLURM_JOB_ID", 0)))
-    version_appendix = int(os.getenv("SLURM_ARRAY_TASK_ID", 0))
-    while True:
-        version_dir = "__".join(
-            (
-                f"version_{version}_{version_appendix}",
-                *(f"{k}_{v}" for k, v in kwargs.items()),
-            )
-        )
-
-        logging_dir = Path(logging_root) / version_dir
-
-        if not logging_dir.exists():
-            break
-        version_appendix += 1
-
-    return str(logging_dir.resolve())
-
-
-def get_tensorboard_logger(logging_dir):
-    writer = SummaryWriter(log_dir=str(logging_dir))
-
-    # writer.add_hparams()
-
-    return writer
-
-
-def write_metrics(writer, metrics: dict, global_step: int):
-    for metric_name, value in metrics.items():
-        if isinstance(value, tuple):
-            probs, labels = value
-            writer_fn = partial(
-                writer.add_pr_curve,
-                labels=labels,
-                predictions=probs,
-            )
-        else:
-            writer_fn = partial(writer.add_scalar, scalar_value=value)
-
-        writer_fn(tag=metric_name, global_step=global_step)
-
-
-def get_optimizer(parameters: list[torch.Tensor], lr: float):
-    return torch.optim.AdamW(parameters, lr=lr)
-
-
-def merge_metrics(suffix, **kwargs):
-    return {f"{k}/{suffix}": v for k, v in kwargs.items()}
-
-
-@torch.no_grad()
-def prepare_data(
-    data: torch.Tensor,
-    labels: torch.Tensor,
-    device: torch.device,
-    transform=v2.Compose([v2.Identity()]),
-):
-
-    data, labels = (
-        data.to(device, non_blocking=True, memory_format=torch.channels_last),
-        labels.to(device, non_blocking=True, dtype=data.dtype),
-    )
-
-    data = transform(data)
-
-    # if resize:
-    #     data = interpolate(data, size=resize, mode="bilinear", align_corners=False)
-
-    # data = normalize_inputs(data, mean, std, normalize)
-
-    return data, labels
+from .models import ImagenetTransferLearning
+from .utils import (
+    get_logging_dir,
+    get_tensorboard_logger,
+    log_metrics,
+    write_metrics,
+    label_smoother,
+    get_transforms,
+    set_seed,
+    save_checkpoint,
+    get_optimizer,
+)
+from .data import get_dataloaders, prepare_data
 
 
 def main(
-    dataset_root: str,
-    model_name: str,
-    lr: float,
-    resize: int,
-    resize_min: int,
-    resize_max: int,
-    rotations: str,
-    normalize: int,
-    dropout_p: float,
-    batch_size: int,
-    use_compile: bool,
-    label_smoothing: float,
-    stochastic_smoothing: bool,
-    lift: str,
-    use_lora: bool,
-    rank: int = 16,
-    alpha: float = 16,
-    log_path: Path = "runs",
-    epochs: int = 120,
-    pos_embed: str = "pre-trained",
+    config: Namespace,
 ):
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
-    profiler_kwargs = {}
+    device = torch.device("cuda")
 
-    if PROFILE:
-        pass
-        # profiling_dir = str(logging_dir)
-        #
-        # global profiler
-        # profiler = torch.profiler.profile(
-        #     schedule=torch.profiler.schedule(wait=0, warmup=1, active=9, repeat=0),
-        #     on_trace_ready=torch.profiler.tensorboard_trace_handler(profiling_dir),
-        # )
-        #
-        # profiler.start()
+    model: nn.Module = ImagenetTransferLearning(**config.model)
 
     logging_dir = get_logging_dir(
-        str(Path.cwd() / log_path),
-        # kwargs
-        model=model_name,
-        lr=lr,
-        normalize=normalize,
-        dropout_p=dropout_p,
-        use_compile=use_compile,
-        label_smoothing=label_smoothing,
-        stochastic_smoothing=stochastic_smoothing,
-        use_lora=use_lora,
-        resize=resize,
-        rank=rank,
-        alpha=alpha,
-        lift=lift,
-        pos_embed=pos_embed,
+        str(Path.cwd() / config.logging["log_dir"]),
+        **config.model,
     )
 
     writer = get_tensorboard_logger(logging_dir)
-
-    device = torch.device("cuda")
-
-    model: nn.Module = ImagenetTransferLearning(
-        model_name=model_name,
-        dropout_p=dropout_p,
-        use_compile=use_compile,
-        lift=lift,
-        use_lora=use_lora,
-        alpha=alpha,
-        rank=rank,
-        pos_embed=pos_embed,
-    )
 
     # noinspection PyArgumentList
     model.to(device=device, memory_format=torch.channels_last)
 
     optimizer = get_optimizer(
-        [param for param in model.parameters() if param.requires_grad], lr=lr
+        [param for param in model.parameters() if param.requires_grad],
+        **config.optimizer,
     )
 
-    train_dataloader, val_dataloader = get_dataloaders(dataset_root, batch_size)
+    train_dataloader, val_dataloader = get_dataloaders(**config.dataloader)
 
-    mean, std = train_dataloader.dataset.compute_statistics(normalize)
+    mean, std = train_dataloader.dataset.compute_statistics(
+        config.data_transforms["normalize"]
+    )
 
-    logging_interval = 10
+    config.data_transforms["mean"] = mean
+    config.data_transforms["std"] = std
+    config.logging["full_log_dir"] = logging_dir
+
+    logging_interval = config.logging["log_frequency"]
 
     train_step_f, val_step_f = (
         partial(
@@ -467,13 +68,8 @@ def main(
                 prepare_data,
                 device=device,
                 transform=get_transforms(
-                    rotations="none" if val else rotations,
-                    crop=True if rotations == "continuous" else False,
-                    resize=resize_max if val else resize,
-                    resize_min=0 if val else resize_min,
-                    resize_max=0 if val else resize_max,
-                    mean=mean,
-                    std=std,
+                    **config.data_transforms,
+                    val=bool(val),
                 ),
             ),
             metrics_logger=partial(
@@ -490,8 +86,8 @@ def main(
         logging_interval=logging_interval,
         smoothing_fn=partial(
             label_smoother,
-            stochastic=stochastic_smoothing,
-            smoothing_factor=label_smoothing,
+            stochastic=config.training["stochastic_smoothing"],
+            smoothing_factor=config.training["label_smoothing"],
         ),
     )
     val_step_f = partial(val_step_f, val_dataloader=val_dataloader)
@@ -501,33 +97,7 @@ def main(
         logging_dir=logging_dir,
         model=model,
         optimizer=optimizer,
-        args={
-            "normalize": normalize,
-            "batch_size": batch_size,
-            "use_compile": use_compile,
-            "label_smoothing": label_smoothing,
-            "stochastic_smoothing": stochastic_smoothing,
-            "lift": lift,
-            "use_lora": use_lora,
-            "rank": rank,
-            "alpha": alpha,
-            "resize": resize,
-            "lr": lr,
-            "dropout_p": dropout_p,
-            "model_name": model_name,
-            "dataset_mean": mean,
-            "dataset_std": std,
-        },
-        model_args={
-            "model_name": model_name,
-            "use_compile": use_compile,
-            "lift": lift,
-            "use_lora": use_lora,
-            "rank": rank,
-            "alpha": alpha,
-            "dropout_p": dropout_p,
-            "pos_embed": pos_embed,
-        },
+        config=config,
     )
 
     best_val_loss = torch.inf
@@ -535,7 +105,7 @@ def main(
 
     best_results = {}
 
-    n_epochs = epochs
+    n_epochs = config.training["epochs"]
     for epoch in range(n_epochs):
 
         global_step = train_step_f(global_step=global_step, model=model)
@@ -556,26 +126,8 @@ def main(
                 write_metrics_f=partial(write_metrics, writer=writer),
             )
 
-    if PROFILE:
-        profiler.stop()
-
     writer.flush()
     writer.close()
-
-
-@torch.no_grad()
-def log_metrics(loss, logits, targets, log_suffix, global_step, write_metrics_f):
-    probs = torch.sigmoid(logits)
-    ap = tef.binary_auprc(probs, targets)
-
-    metrics = merge_metrics(
-        bce_loss=loss,
-        au_pr_curve=ap,
-        pr_curve=(probs.to(torch.float32), targets.to(torch.float32)),
-        suffix=log_suffix,
-    )
-
-    write_metrics_f(metrics=metrics, global_step=global_step)
 
 
 @torch.no_grad()
@@ -614,16 +166,6 @@ def val_step(model, val_dataloader, global_step, metrics_logger, prepare_data_f)
     )
 
     return mean_loss, logits, targets
-
-
-def label_smoother(
-    labels: torch.tensor, smoothing_factor: float = 0.1, stochastic: bool = True
-):
-    smoothing_factor = smoothing_factor - (
-        torch.rand_like(labels) * smoothing_factor * stochastic
-    )
-    smoothed_label = (1 - smoothing_factor) * labels + 0.5 * smoothing_factor
-    return smoothed_label
 
 
 def train_step(
@@ -669,437 +211,137 @@ def train_step(
     return global_step
 
 
-class MultiEpochsDataLoader(torch.utils.data.DataLoader):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._DataLoader__initialized = False
-        if self.batch_sampler is None:
-            self.sampler = _RepeatSampler(self.sampler)
-        else:
-            self.batch_sampler = _RepeatSampler(self.batch_sampler)
-        self._DataLoader__initialized = True
-        self.iterator = super().__iter__()
-
-    def __len__(self):
-        return (
-            len(self.sampler)
-            if self.batch_sampler is None
-            else len(self.batch_sampler.sampler)
-        )
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield next(self.iterator)
-
-    def __hash__(self):
-        return hash(self.dataset) + 10000
-
-
-class _RepeatSampler(object):
-    """Sampler that repeats forever.
-
-    Args:
-        sampler (Sampler)
-    """
-
-    def __init__(self, sampler):
-        self.sampler = sampler
-
-    def __iter__(self):
-        while True:
-            yield from iter(self.sampler)
-
-
-class Rotate90Transform:
-    def __init__(self, angles=[0, 90, 180, 270]):
-        self.angles = angles
-
-    def __call__(self, x):
-        angle = np.random.choice(self.angles)
-        return v2.functional.rotate(x, int(angle), InterpolationMode.BILINEAR)
-
-
-class RotateAndCrop:
-    def __init__(self, rotate=True):
-        self.rotate = rotate
-        self.max_crop_factor = np.sqrt(2)
-
-    def __call__(self, x):
-        angle = 0
-        if self.rotate:
-            angle = np.random.uniform(-180, 180)
-            x = v2.functional.rotate(x, angle, InterpolationMode.BILINEAR)
-
-        angle_rad = np.deg2rad(angle)
-        *_, h, w = x.shape
-        # Compute the factor with which the image needs to be cropped to perfectly fit the largest possible square
-        min_crop_factor = abs(np.cos(angle_rad)) + abs(np.sin(angle_rad))
-        crop_size = int(
-            min(h, w) / np.random.uniform(min_crop_factor, self.max_crop_factor)
-        )
-
-        return v2.functional.center_crop(x, crop_size)
-
-
-class ResizeAndNoise:
-    def __init__(self, resize=0):
-        self.resize = resize
-
-    def __call__(self, x):
-        *_, h, w = x.shape
-        resize_factor = self.resize / max(h, w)
-        sigma = 0.5 * resize_factor
-        x = x + torch.randn_like(x) * sigma
-        x = interpolate(
-            x,
-            size=(int(h * resize_factor), int(w * resize_factor)),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return x
-
-
-class RandomResizeAndNoise:
-    def __init__(self, resize_min=0, resize_max=0):
-        self.sizes = list(range(resize_min, resize_max + 1, 56))
-
-    def __call__(self, x):
-        *_, h, w = x.shape
-        size = np.random.choice(self.sizes)
-        resize_factor = size / h
-        sigma = 0.5 * resize_factor
-        x = x + torch.randn_like(x) * sigma
-        x = interpolate(
-            x,
-            size=(size, size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return x
-
-
-@lru_cache(maxsize=1)
-def get_transforms(
-    rotations: str = "none",
-    crop: bool = False,
-    resize: int = 0,
-    resize_min: int = 0,
-    resize_max: int = 0,
-    mean: float = 0,
-    std: float = 1,
-):
-
-    transforms = [v2.Normalize(mean=mean, std=std)]
-
-    if rotations == "orthogonal" and eval:
-        transforms.append(Rotate90Transform())
-    elif rotations == "continuous" or crop:
-        transforms.append(RotateAndCrop(rotate=rotations == "continuous"))
-
-    if resize:
-        transforms.append(ResizeAndNoise(resize))
-    elif resize_min and resize_max:
-        transforms.append(RandomResizeAndNoise(resize_min, resize_max))
-
-    if rotations != "none":
-        transforms.append(v2.RandomHorizontalFlip(p=0.5))
-    return v2.Compose(transforms)
-
-
-def save_checkpoint(logging_dir, model, optimizer, global_step, **kwargs):
-    old_checkpoints = Path(logging_dir).glob("*.pth")
-    for old_checkpoint in old_checkpoints:
-        Path.unlink(old_checkpoint)
-
-    torch.save(
-        {
-            "model": type(model),
-            "model_state_dict": model.state_dict(),
-            "optimizer": type(optimizer),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "step": global_step,
-            **kwargs,
-        },
-        f=(logging_dir + f"/ckpt_step={global_step}.pth"),
-    )
-
-
-def load_checkpoint(ckpt_path, device="cuda"):
-    if os.path.isfile(ckpt_path):
-        ckpt_dict = torch.load(ckpt_path, weights_only=False, map_location=device)
-    else:
-        files = os.listdir(ckpt_path)
-        possible_checkpoints = list(filter(lambda x: x.endswith(".pth"), files))
-        if len(possible_checkpoints) != 1:
-            raise ValueError(
-                f"Too many checkpoint files in the given checkpoint directory. Please specify the model you want to load directly."
-            )
-        ckpt_path = f"{ckpt_path}/{possible_checkpoints[0]}"
-        ckpt_dict = torch.load(ckpt_path, weights_only=False, map_location=device)
-
-    # strip 'model_' from the name
-    model_name = ckpt_dict["args"]["model_name"]
-    if "model_args" in ckpt_dict["args"]:
-        model = ckpt_dict["model"](**ckpt_dict["model_args"]).to(device)
-    else:
-        dropout_p = ckpt_dict["args"]["dropout_p"]
-        use_lora = ckpt_dict["args"]["use_lora"]
-        rank = ckpt_dict["args"]["rank"]
-        alpha = ckpt_dict["args"]["alpha"]
-        lift = ckpt_dict["args"]["lift"]
-        model_name = ckpt_dict["args"]["model_name"]
-
-        model = ckpt_dict["model"](
-            model_name=model_name,
-            dropout_p=dropout_p,
-            use_lora=use_lora,
-            lift=lift,
-            alpha=alpha,
-            rank=rank,
-        ).to(device)
-    model.load_state_dict(ckpt_dict["model_state_dict"])
-    lr = ckpt_dict["args"]["lr"]
-    try:
-        # FIXME: add optim class and args to state dict
-        optim = ckpt_dict.get("optimizer", torch.optim.AdamW)(
-            lr=lr, params=model.classifier.parameters()
-        ).load_state_dict(ckpt_dict["optimizer_state_dict"])
-    except Exception as e:
-        print(f"Could not load optim due to {e}; skipping.")
-        optim = None
-
-    return {"model": model, "optim": optim, "args": ckpt_dict["args"]}
-
-
-def get_argparser():
-    """
-    Create and return an argument parser for hyperparameter tuning.
-    """
-    # Create the parser
-    parser = argparse.ArgumentParser(
-        description="Hyperparameter tuning for a machine learning model."
-    )
-
-    # Add arguments
-    parser.add_argument("dataset_root", type=Path)
-    parser.add_argument(
-        "--lr", type=float, help="Learning rate for the model.", default=1e-4
-    )
-    parser.add_argument("--batch_size", type=int, help="Batch size", default=32)
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        help="The model to use.",
-        default="dinov2_vitb14_reg",
-        choices=[
-            "resnet50",
-            "resnet152",
-            "resnext50_32x4d",
-            "resnext101_64x4d",
-            "efficientnet_v2_l",
-            "vit_l_16",
-            "dinov2_vits14",
-            "dinov2_vitb14",
-            "dinov2_vitl14",
-            "dinov2_vitg14",
-            "dinov2_vits14_reg",
-            "dinov2_vitb14_reg",
-            "dinov2_vitl14_reg",
-            "dinov2_vitg14_reg",
-        ],
-    )
-    parser.add_argument(
-        "--normalize",
-        type=int,
-        help="Whether to do normalization",
-        default=1,
-        choices=[0, 1],
-    )
-    parser.add_argument(
-        "--dropout_p", type=float, help="Dropout probability", default=0.25
-    )
-    parser.add_argument(
-        "--resize",
-        type=int,
-        default=0,
-        help="Resize the images to this size. 0 means no resizing. Cannot be used in conjunction with resize_min and resize_max.",
-    )
-
-    parser.add_argument(
-        "--resize_min",
-        type=int,
-        default=0,
-        help="Minimum size to resize to during random resizing for each training batch. Cannot be used in conjuction with resize.",
-    )
-
-    parser.add_argument(
-        "--resize_max",
-        type=int,
-        default=0,
-        help="Maximum size to resize to for each training batch. Cannot be used in conjunction with resize.",
-    )
-
-    parser.add_argument(
-        "--rotations",
-        type=str,
-        default="none",
-        choices=["orthogonal", "continuous", "none"],
-        help='Rotations to apply to the images. "orthogonal" means multiples of 90 degree rotations, "continuous" means any rotation (resulting in additional cropping), "none" means no rotations.',
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=120,
-        help="number of epochs",
-    )
-    parser.add_argument("--use_compile", action="store_true")
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="[DISABLED] profile the training and validation loop",
-    )
-    parser.add_argument(
-        "-d",
-        "--deterministic",
-        action="store_true",
-        help="use deterministic training",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0,
-        help="Label smoothing factor",
-    )
-
-    parser.add_argument(
-        "--stochastic_smoothing",
-        action="store_true",
-        help="use stochastic smoothing",
-    )
-
-    parser.add_argument(
-        "--lift",
-        type=str,
-        default="stack",
-        choices=["stack", "conv", "reinit_first"],
-        help="How to lift single channel to 3 channels. Stacking stacks the single channel thrice. Conv adds a 1x1 convolution layer before the model. reinit_first re-initialises the first layer if applicable.",
-    )
-
-    parser.add_argument(
-        "--use_lora",
-        action="store_true",
-        help="Whether to use LoRA if applicable.",
-    )
-
-    parser.add_argument(
-        "--pos_embed",
-        type=str,
-        default="pre-trained",
-        choices=["pre-trained", "fine-tune", "zeros", "zeros-fine-tune"],
-        help="How to handle positional embeddings",
-    )
-
-    parser.add_argument("--rank", type=int, default=16, help="rank of LoRA")
-
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=None,
-        help="LoRA alpha scaling. Defaults to rank value if not set",
-    )
-
-    parser.add_argument("--log_path", type=str, default="runs")
-
-    return parser.parse_args()
-
-
-def sanity_check_args(parsed_args):
-    assert parsed_args.lr >= 0
-    assert parsed_args.batch_size >= 0
-    assert 0 <= parsed_args.dropout_p <= 1
-    assert parsed_args.resize >= 0
-    assert 0 <= parsed_args.label_smoothing <= 1
+def sanity_check_config(config):
+    assert config.optimizer["lr"] >= 0
+    assert config.dataloader["batch_size"] >= 0
+    assert config.data_transforms["resize_val"] >= 0
+    assert 0 <= config.model["dropout_p"] <= 1
+    assert 0 <= config.training["label_smoothing"] <= 1
     assert not (
-        (parsed_args.model_name == "vit_l_16" or parsed_args.model_name == "dino_v2")
-        and parsed_args.lift == "reinit_first"
+        (
+            config.model["model_name"] == "vit_l_16"
+            or config.model["model_name"] == "dino_v2"
+        )
+        and config.model["lift"] == "reinit_first"
     )
     # ViT always needs the input size to be 512x512
-    if parsed_args.model_name == "vit_l_16" and parsed_args.resize != 512:
+    if config.model["model_name"] == "vit_l_16" and (
+        config.data_transforms["resize_min"] != 512
+        or config.data_transforms["resize_max"] != 512
+        or config.data_transforms["resize_val"] != 512
+    ):
         print("Setting resize to 512 since vit_16_l is being used")
-        parsed_args.resize = 512
+        config.data_transforms["resize_min"] = 512
+        config.data_transforms["resize_max"] = 512
+        config.data_transforms["resize_val"] = 512
     if (
-        "dinov2" in parsed_args.model_name
-        and parsed_args.resize == 0
-        and parsed_args.resize_min == 0
-        and parsed_args.resize_max == 0
+        "dinov2" in config.model["model_name"]
+        and config.data_transforms["resize_min"] == 0
+        and config.data_transforms["resize_max"] == 0
     ):
         resize = 560
         print(f"\n#######\nSetting resize to {resize} \n######\n")
-        parsed_args.resize = resize
+        config.data_transforms["resize_min"] = resize
+        config.data_transforms["resize_max"] = resize
 
-    assert not (
-        parsed_args.resize != 0
-        and (parsed_args.resize_min != 0 or parsed_args.resize_max != 0)
-    ), "resize cannot be set together with resize_min or resize_max."
+    assert (
+        config.data_transforms["resize_max"] >= 0
+        and config.data_transforms["resize_min"] >= 0
+    ), "resize_min and resize_max must be non-negative"
 
-    assert not (
-        (parsed_args.resize_min != 0 and parsed_args.resize_max == 0)
-        or (parsed_args.resize_min == 0 and parsed_args.resize_max != 0)
-    ), "Both resize_min and resize_max must be set together."
+    if (
+        config.data_transforms["resize_max"] > 0
+        or config.data_transforms["resize_min"] > 0
+    ):
+        assert (
+            config.data_transforms["resize_max"] > 0
+            and config.data_transforms["resize_min"] > 0
+        ), "If one of resize_min or resize_max is positive, both must be positive"
 
-    if parsed_args.use_lora and not "dinov2" in parsed_args.model_name:
+    if config.model["use_lora"] and not "dinov2" in config.model["model_name"]:
         warnings.warn(
             "Warning: LoRA is only supported for Dino V2 models. Ignoring setting....\n",
             UserWarning,
         )
-        parsed_args.use_lora = False
+        config.model["use_lora"] = False
 
-    if parsed_args.alpha is None:
-        parsed_args.alpha = parsed_args.rank
+    if config.model["lora_alpha"] is None:
+        config.model["lora_alpha"] = config.model["lora_rank"] * 2
 
     assert (
-        parsed_args.resize % 56 == 0 or parsed_args.model_name != "dino_v2"
-    ), "resizing must be a multiple of 56 for Dino V2 models (8 for efficiency, 14 for patch size)"
-    assert (
-        parsed_args.resize_min % 56 == 0 or parsed_args.model_name != "dino_v2"
+        config.data_transforms["resize_min"] % 56 == 0
+        or config.model["model_name"] != "dino_v2"
     ), "resizing must be a multiple of 14 for Dino V2 models (8 for efficiency, 14 for patch size)"
     assert (
-        parsed_args.resize_max % 56 == 0 or parsed_args.model_name != "dino_v2"
+        config.data_transforms["resize_max"] % 56 == 0
+        or config.model["model_name"] != "dino_v2"
     ), "resizing must be a multiple of 14 for Dino V2 models (8 for efficiency, 14 for patch size)"
 
-    return parsed_args
+    assert (
+        config.data_transforms["resize_val"] % 56 == 0
+        or config.model["model_name"] != "dino_v2"
+    ), "resizing must be a multiple of 14 for Dino V2 models (8 for efficiency, 14 for patch size)"
+
+    assert config.model["pos_embed"] in [
+        "pre-trained",
+        "fine-tune",
+        "zeros",
+        "zeros+fine-tune",
+    ], "pos_embed must be one of 'pre-trained', 'fine-tune', 'zeros', or 'zeros+fine-tune'"
+
+    assert config.data_transforms["transform_group"] in [
+        "C1",
+        "D4",
+        "O2",
+    ], "transform_group must be one of 'C1', 'D4', or 'O2'"
 
 
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    # torch.use_deterministic_algorithms(True)
-    # torch.utils.deterministic.fill_uninitialized_memory = False
+def load_config(config_path, overrides):
+    def str_to_bool(s):
+        if isinstance(s, str):
+            s_lower = s.lower()
+            if s_lower == "true":
+                return True
+            elif s_lower == "false":
+                return False
+        elif isinstance(s, int):
+            return bool(s)
+        raise ValueError(f"Invalid boolean string: {s}")
 
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_id)
-    random.seed(worker_seed)
+    # Apply overrides
+    for key_val in overrides:
+        keys, val = key_val.split("=")
+        keys = keys.split(".")
+        d = config
+        for k in keys[:-1]:
+            d = d[k]
+        val_type = type(d.get(keys[-1], val))
+        if val_type == bool:
+            val = str_to_bool(val)
+        else:
+            val = val_type(val)
+        d[keys[-1]] = val  # cast to correct type
+    return Namespace(**config)
 
 
 if __name__ == "__main__":
-    args = get_argparser()
-    parsed_args = sanity_check_args(args)
-    kwargs = vars(args)
-    print(kwargs)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", type=Path)
+    parser.add_argument("overrides", nargs="*", default=[])
+    args = parser.parse_args()
 
-    if kwargs["profile"]:
-        PROFILE = True
-    if kwargs["deterministic"]:
-        SEED = 42
-        set_seed(SEED)
-    del kwargs["deterministic"]
-    del kwargs["profile"]
+    print(args)
 
-    main(**kwargs)
+    config = load_config(args.config, args.overrides)
+
+    print(config)
+
+    sanity_check_config(config)
+
+    if config.reproducibility["seed"] is not None:
+        set_seed(config.reproducibility["seed"])
+
+    main(config)
