@@ -1,7 +1,7 @@
 # Step by step for running a model
 ## Install repository
 ```shell
-pip install git+https://github.com/LOFAR-VLBI/astroNNomy.git
+pip install --force-reinstall --no-cache-dir -e  git+https://github.com/LOFAR-VLBI/astroNNomy.git#egg=astroNNomy
 ```
 
 ## Get training data
