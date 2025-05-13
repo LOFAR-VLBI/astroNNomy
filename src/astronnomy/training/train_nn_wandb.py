@@ -24,7 +24,7 @@ from .utils import (
     load_checkpoint,
 )
 from .data import get_dataloaders, prepare_data
-from .train_nn_yaml import *
+from .train_nn import *
 
 
 def setup_wandb(config, model):

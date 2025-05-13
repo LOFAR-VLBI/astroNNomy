@@ -11,6 +11,8 @@ from joblib import Parallel, delayed, Memory
 import joblib
 from matplotlib.colors import SymLogNorm
 from torch.utils.data import Dataset
+import argparse
+from pathlib import Path
 
 
 def get_rms(data: np.ndarray, maskSup=1e-7):
@@ -293,8 +295,25 @@ def make_histogram(root_dir):
 
 
 if __name__ == "__main__":
-    root = f"/scratch-shared/CORTEX/public.spider.surfsara.nl/lofarvwf/jdejong/CORTEX/calibrator_selection_robertjan/cnn_data"
-    transform_data(root)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("root_dir", type=Path)
+    parser.add_argument(
+        "--classes",
+        nargs="+",
+        default=["continue", "stop"],
+        help="List of classes to process",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        default=["", "_val"],
+        help="List of classes to process",
+    )
+    args = parser.parse_args()
+    # exit()
+
+    # root = f"/scratch-shared/CORTEX/public.spider.surfsara.nl/lofarvwf/jdejong/CORTEX/calibrator_selection_robertjan/cnn_data"
+    transform_data(**vars(args))
 
     # make_histogram(root)
     # dataset.compute_statistics(normalize=1)
