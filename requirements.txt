@@ -9,6 +9,7 @@ astropy>6.0.0
 xformers
 tensorboard
 scikit-learn
+wandb
 
 dino-finetune @ git+https://github.com/sara-nl/dinov2-finetune.git
 cortexchange @ git+https://github.com/sara-nl/cortExchange.git
