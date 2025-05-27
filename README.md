@@ -37,3 +37,8 @@ The dataloader expect filetree to be in the following format:
   |- continue_val
   |- stop_val
 ```
+
+
+
+# Acknowledgments
+This repository is part of the project CORTEX (NWA.1160.18.316) of the research programme NWA-ORC which is (partly) financed by the Dutch Research Council (NWO). 
