@@ -111,11 +111,11 @@ def load_model(architecture_name, model_name, device="cpu"):
 
 
 @torch.no_grad()
-def get_confusion_matrix(predictor, dataloader, mean, std, thresholds):
+def get_confusion_matrix(predictor, dataloader, thresholds, **kwargs):
     conf_matrix_dict = {thres: np.zeros((2, 2)) for thres in thresholds}
     thresholds_tensor = torch.tensor(thresholds)
     for i, (img, label) in enumerate(dataloader):
-        data = predictor.prepare_batch(img, mean=mean, std=std)
+        data = predictor.prepare_batch(img, **kwargs)
         pred = torch.sigmoid(predictor.model(data)).to("cpu")
         preds_thres = pred >= thresholds_tensor
         for i, thres in enumerate(thresholds):
@@ -139,6 +139,7 @@ def plot_conf_matrices(savedir, conf_matrix_dict, thresholds):
         disp.plot()
 
         plt.savefig(f"{savedir}/confusion_thres_{thres:.3f}.png")
+        plt.close()
 
 
 def process_fits(fits_path):
@@ -170,37 +171,41 @@ def get_dataloader(data_root, mode="val", batch_size=32):
 
 if __name__ == "__main__":
     # Latest model
-    model_name = "surf/dino_big_lora_default_pos_november_09876"
-    TESTING = True
-    architecture_name = "surf/TransferLearning"
+    model_name = "surf/dino_big_lora_tune_posclsreg_may_O2_aug_0999"
+    TESTING = False
+    architecture_name = "surf/TransferLearningV2"
     # Set Device here
     DEVICE = "cuda"
     # Thresholds to consider for classification
     thresholds = [0.2, 0.3, 0.4, 0.5]
     # Change to directory of files. Should have subfolders 'continue_val' and 'stop_val'
     data_root = "/scratch-shared/CORTEX/public.spider.surfsara.nl/lofarvwf/jdejong/CORTEX/calibrator_selection_robertjan/cnn_data"
+    predictor = None
     # Uses cached confusion matrix for testing the plotting functionalities
-    savedir = model_name.split("/")[-1]
-    dict_fname = f"{savedir}/conf_matrix.npydict"
-    print(Path(dict_fname).exists(), dict_fname)
-    if Path(dict_fname).exists() and TESTING:
-        conf_matrix_dict = np.load(dict_fname, allow_pickle=True)[()]
-    else:
+    for resize in range(1792, 2017, 112):
+        savedir = model_name.split("/")[-1] + f"/{resize}"
+        dict_fname = f"{savedir}/conf_matrix.npydict"
+        print(Path(dict_fname).exists(), dict_fname)
+        if Path(dict_fname).exists() and TESTING:
+            conf_matrix_dict = np.load(dict_fname, allow_pickle=True)[()]
+        else:
 
-        os.makedirs(savedir, exist_ok=True)
+            os.makedirs(savedir, exist_ok=True)
 
-        dataloader = get_dataloader(data_root, mode="val")
+            dataloader = get_dataloader(data_root, mode="val", batch_size=16)
+            if predictor is None:
+                # Load the model only once
+                print("Loading model...")
+                predictor = load_model(architecture_name, model_name, device=DEVICE)
+                print(predictor.config)
+                exit()
 
-        predictor = load_model(architecture_name, model_name, device=DEVICE)
+            conf_matrix_dict = get_confusion_matrix(
+                predictor, dataloader, thresholds, resize=resize
+            )
+            with open(dict_fname, "wb") as f:
+                np.save(f, conf_matrix_dict)
 
-        mean, std = predictor.args["dataset_mean"], predictor.args["dataset_std"]
+        print(conf_matrix_dict)
 
-        conf_matrix_dict = get_confusion_matrix(
-            predictor, dataloader, mean, std, thresholds
-        )
-        with open(dict_fname, "wb") as f:
-            np.save(f, conf_matrix_dict)
-
-    print(conf_matrix_dict)
-
-    plot_conf_matrices(savedir, conf_matrix_dict, thresholds)
+        plot_conf_matrices(savedir, conf_matrix_dict, thresholds)

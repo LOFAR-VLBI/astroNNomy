@@ -164,24 +164,6 @@ def wb_write_metrics(metrics: dict, global_step: int):
             metrics[metric_name] = wandb.Image(fig)
             plt.close(fig)  # Close the figure to avoid memory leaks
 
-            # if final_step:
-            #     print(preds, targets)
-            #     wandb_plot = wandb.plot.pr_curve(
-            #         targets.cpu().numpy().astype(int),
-            #         torch.stack([preds, 1 - preds], dim=1).cpu().numpy(),
-            #         labels=["continue", "stop"],
-            #         title=f"PR {metric_name}",
-            #     )
-            #     # additional_metrics[f"wandb_pr/{metric_name}"] = wandb_plot
-            #     # table = wandb.Table(columns=["scores", "labels"])
-            #     # for s, l in zip(preds.cpu().numpy(), targets.cpu().numpy()):
-            #     #     table.add_data(float(s), int(l))
-
-            #     # wandb_plot = wandb.plot.pr_curve(
-            #     #     table, "labels", "scores", title=f"PR {metric_name}"
-            #     # )
-            #     # additional_metrics[f"wandb_pr/{metric_name}"] = wandb_plot
-            #     wandb.log({f"wandb_pr/{metric_name}": wandb_plot}, step=global_step)
     else:
         wandb.log(metrics | additional_metrics, step=global_step)
 
@@ -336,38 +318,3 @@ if __name__ == "__main__":
 
     thing = RandomResizeAndNoise(534, 899)
     print(thing)
-#     from sys import getsizeof
-
-#     ckpt_dict = torch.load(
-#         "/home/larsve/projects/astroNNomy/src/grid_search_2/version_0_2__model_name_dinov2_vitb14_reg__dropout_p_0.25__lift_stack__use_lora_True__lora_rank_32__lora_alpha_64__tune_register_token_False__tune_cls_token_True__pos_embed_fine-tune__use_compile_False__tune_register_tokens_true/ckpt_step=268.pth"
-#     )
-
-#     config = ckpt_dict["config"]
-
-#     model = ckpt_dict["model"](**config.model).to("cuda")
-
-#     state_dict = ckpt_dict["model_state_dict"]
-
-#     model.load_state_dict(state_dict, strict=False)
-
-# pretrained_dict = {
-#     key: value for key, value in state_dict.items() if "qkv.linear" in key
-# }
-
-# # print(state_dict.keys())
-
-# for key in state_dict.keys():
-#     if not ("qkv.linear" in key):
-# #         del state_dict[key]
-
-# pretrained_dict = {
-#     key: value for key, value in state_dict.items() if "qkv.linear" in key
-# }
-
-# model.load_state_dict(pretrained_dict, strict=False)
-
-# optim = ckpt_dict.get("optimizer", torch.optim.AdamW)(
-#     params=[param for param in model.parameters() if param.requires_grad],
-#     **config.optimizer,
-# )
-# optim.load_state_dict(ckpt_dict["optimizer_state_dict"])
