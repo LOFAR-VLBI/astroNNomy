@@ -172,8 +172,8 @@ def init_dino(model_name, use_lora, rank=16, alpha=32):
     try:
         backbone = torch.hub.load("facebookresearch/dinov2", model_name)
     except RuntimeError as e:
-         if "Outbound internet access is disabled" in str(e):
-             print(f"Outbound internet access not allowed. Trying to load model from local cache only...")
+         if "internet access is disabled" in str(e):
+             print(f"Internet access is disabled. Trying to load model from local cache only.... Use `export TORCH_HUB_OFFLINE=1` if this fails")
          else:
              raise
          backbone = torch.hub.load(f"{torch.hub.get_dir()}/facebookresearch_dinov2_main", model_name, source='local')
