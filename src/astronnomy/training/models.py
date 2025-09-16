@@ -247,7 +247,6 @@ def init_first_conv(conv):
 
 def get_classifier(dropout_p: float, n_features: int, num_target_classes: int):
     assert 0 <= dropout_p <= 1
-    print(n_features)
 
     classifier = nn.Sequential(
         nn.Flatten(),
