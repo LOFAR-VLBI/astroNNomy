@@ -1,4 +1,4 @@
-# import socket
+import socket
 # import os
 
 # # Optional opt-out: set ALLOW_NETWORK=1 to disable this block.
@@ -42,22 +42,21 @@ warnings.filterwarnings(
 )
 
 # Make sure to store these variables.
-login = os.getenv("WD_LOGIN")
-password = os.getenv("WD_PASSWORD")
-
+# login = os.getenv("WD_LOGIN")
+# password = os.getenv("WD_PASSWORD")
 
 
 init_downloader(
-    url="https://researchdrive.surfsara.nl/public.php/webdav/",
+    url="https://researchdrive.surf.nl/public.php/webdav/",
     cache=f"{os.path.join(os.path.expanduser('~'), '.cache/cortexchange')}",
-    login=login,
-    password=password,
+    login="WsSxVZHPqHlKcvY",
+    password="PublicAccess1!",
 )
 from cortexchange.architecture import get_architecture, Architecture
 
 TransferLearning: type(Architecture) = get_architecture("surf/TransferLearningV2")
 model = TransferLearning(
-    device="cuda", model_name="surf/dino_big_lora_tune_posclsreg_may_O2_aug_099"
+    device="cpu", model_name="surf/dino_big_lora_tune_posclsreg_may_O2_aug_099"
 )
 
 
